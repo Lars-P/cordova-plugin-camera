@@ -74,59 +74,189 @@ var DEFAULT_ASPECT_RATIO = '1.8';
 var HIGHEST_POSSIBLE_Z_INDEX = 2147483647;
 
 // Resize method
-function resizeImage (successCallback, errorCallback, file, targetWidth, targetHeight, encodingType) {
-    var tempPhotoFileName = '';
-    var targetContentType = '';
+function resizeImage(successCallback, errorCallback, file, targetWidth, targetHeight, encodingType) {
+	//encodingType wird zurzeit nicht verwendet
+	var originalWidth;
+	var originalHeight;
+	var encoder;
+	var decoder;
+	var file;
+	var fileStream;
+	var memStream = new Windows.Storage.Streams.InMemoryRandomAccessStream();
+	var exifOrientation = Windows.Storage.FileProperties.PhotoOrientation.normal;
+	var userRotation = Windows.Storage.FileProperties.PhotoOrientation.normal;
+	var disableExifOrientation = false;
 
-    if (encodingType === Camera.EncodingType.PNG) {
-        tempPhotoFileName = 'camera_cordova_temp_return.png';
-        targetContentType = 'image/png';
-    } else {
-        tempPhotoFileName = 'camera_cordova_temp_return.jpg';
-        targetContentType = 'image/jpeg';
-    }
+	file.openAsync(Windows.Storage.FileAccessMode.readWrite).then(function (stream) {
+		fileStream = stream;
+		return Windows.Graphics.Imaging.BitmapDecoder.createAsync(fileStream);
+	}).then(function (_decoder) {
+	    decoder = _decoder;
+		originalHeight = decoder.pixelHeight;
+		originalWidth = decoder.pixelWidth;
 
-    var storageFolder = getAppData().localFolder;
-    file.copyAsync(storageFolder, file.name, Windows.Storage.NameCollisionOption.replaceExisting)
-        .then(function (storageFile) {
-            return fileIO.readBufferAsync(storageFile);
-        })
-        .then(function (buffer) {
-            var strBase64 = encodeToBase64String(buffer);
-            var imageData = 'data:' + file.contentType + ';base64,' + strBase64;
-            var image = new Image(); /* eslint no-undef : 0 */
-            image.src = imageData;
-            image.onload = function () {
-                var ratio = Math.min(targetWidth / this.width, targetHeight / this.height);
-                var imageWidth = ratio * this.width;
-                var imageHeight = ratio * this.height;
+		return decoder.bitmapProperties.getPropertiesAsync(["System.Photo.Orientation"]);
+	}).then(function (props) {
+	    if (props.hasKey("System.Photo.Orientation")) {
+	        exifOrientation = props["System.Photo.Orientation"].value;
+	    }
 
-                var canvas = document.createElement('canvas');
-                var storageFileName;
+	    // Set the encoder's destination to the temporary, in-memory stream.
+	    return Windows.Graphics.Imaging.BitmapEncoder.createForTranscodingAsync(memStream, decoder);
+	}).then(function (_encoder) {
+		encoder = _encoder;
 
-                canvas.width = imageWidth;
-                canvas.height = imageHeight;
+		var ratio = Math.min(targetWidth / originalWidth, targetHeight / originalHeight);
+		var scaledWidth = ratio * originalWidth;
+		var scaledHeight = ratio * originalHeight;
+		
+		if (originalWidth < originalHeight) {
+			var aspectRatio = originalWidth / originalHeight;
+			scaledWidth = scaledHeight * aspectRatio;
+		} else {
+			var aspectRatio = originalWidth / originalHeight;
+			scaledHeight = scaledWidth / aspectRatio;
+		}
+				
+		encoder.bitmapTransform.scaledWidth = scaledWidth;
+		encoder.bitmapTransform.scaledHeight = scaledHeight;
 
-                canvas.getContext('2d').drawImage(this, 0, 0, imageWidth, imageHeight);
+		// Fant is a relatively high quality interpolation mode.
+		encoder.bitmapTransform.interpolationMode = Windows.Graphics.Imaging.BitmapInterpolationMode.fant;
 
-                var fileContent = canvas.toDataURL(targetContentType).split(',')[1];
+		// Attempt to generate a new thumbnail to reflect any rotation operation.
+		encoder.isThumbnailGenerated = true;
 
-                var storageFolder = getAppData().localFolder;
+		// If the file format supports EXIF orientation ("System.Photo.Orientation") then
+		// update the orientation flag to reflect any user-specified rotation.
+		// Otherwise, perform a hard rotate using BitmapTransform.
+		if (disableExifOrientation === false) {
+		    var add90DegreesCW = function add90DegreesCW(photoOrientation) {
+		        switch (photoOrientation) {
+		            case Windows.Storage.FileProperties.PhotoOrientation.normal:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate270;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate90:
+		                return Windows.Storage.FileProperties.PhotoOrientation.normal;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate180:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate90;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate270:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate180;
+		            default:
+		                // Ignore any values with flip/mirroring. 
+		                return Windows.Storage.FileProperties.PhotoOrientation.unspecified;
+		        }
+		    };
 
-                storageFolder.createFileAsync(tempPhotoFileName, OptUnique)
-                    .then(function (storagefile) {
-                        var content = Windows.Security.Cryptography.CryptographicBuffer.decodeFromBase64String(fileContent);
-                        storageFileName = storagefile.name;
-                        return fileIO.writeBufferAsync(storagefile, content);
-                    })
-                    .done(function () {
-                        successCallback('ms-appdata:///local/' + storageFileName);
-                    }, errorCallback);
-            };
-        })
-        .done(null, function (err) {
-            errorCallback(err);
-        });
+		    // "Add" 90 degrees counter-clockwise rotation to a PhotoOrientation value. 
+		    // For simplicity, does not handle any values with flip/mirroring; therefore this is a potentially 
+		    // lossy transformation. 
+		    // Note that PhotoOrientation uses a counterclockwise convention. 
+		    var add90DegreesCCW = function add90DegreesCCW(photoOrientation) {
+		        switch (photoOrientation) {
+		            case Windows.Storage.FileProperties.PhotoOrientation.normal:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate90;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate90:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate180;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate180:
+		                return Windows.Storage.FileProperties.PhotoOrientation.rotate270;
+		            case Windows.Storage.FileProperties.PhotoOrientation.rotate270:
+		                return Windows.Storage.FileProperties.PhotoOrientation.normal;
+		            default:
+		                // Ignore any values with flip/mirroring. 
+		                return Windows.Storage.FileProperties.PhotoOrientation.unspecified;
+		        }
+		    };
+
+		    var netExifOrientation = exifOrientation;
+
+		    switch (userRotation) {
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate90:
+		            netExifOrientation = add90DegreesCCW(exifOrientation);
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate180:
+		            netExifOrientation = add90DegreesCCW(add90DegreesCCW(exifOrientation));
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate270:
+		            netExifOrientation = add90DegreesCW(exifOrientation);
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.normal:
+		            netExifOrientation = exifOrientation;
+		            break;
+		    }
+
+			// BitmapProperties requires the application to explicitly declare the type
+			// of the property to be written - this is different from FileProperties which
+			// automatically coerces the value to the correct type. System.Photo.Orientation
+			// is defined as a UInt16.
+			var orientationTypedValue = new Windows.Graphics.Imaging.BitmapTypedValue(
+				netExifOrientation,
+				Windows.Foundation.PropertyType.uint16
+				);
+
+			var properties = new Windows.Graphics.Imaging.BitmapPropertySet();
+			properties["System.Photo.Orientation"] = orientationTypedValue;
+			return encoder.bitmapProperties.setPropertiesAsync(properties);
+		} else {
+		    var bitmapRotation = Windows.Graphics.Imaging.BitmapRotation.none;
+
+		    switch (userRotation) {
+		        case Windows.Storage.FileProperties.PhotoOrientation.normal:
+		            bitmapRotation = Windows.Graphics.Imaging.BitmapRotation.none;
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate270:
+		            bitmapRotation = Windows.Graphics.Imaging.BitmapRotation.clockwise90Degrees;
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate180:
+		            bitmapRotation = Windows.Graphics.Imaging.BitmapRotation.clockwise180Degrees;
+		            break;
+		        case Windows.Storage.FileProperties.PhotoOrientation.rotate90:
+		            bitmapRotation = Windows.Graphics.Imaging.BitmapRotation.clockwise270Degrees;
+		            break;
+		    }
+
+		    return encoder.bitmapTransform.rotation = bitmapRotation;
+		}
+	}).then(function () {
+		return encoder.flushAsync();
+	}).then(null, function (error) {
+		switch (error.number) {
+			// If the encoder does not support writing a thumbnail, then try again
+			// but disable thumbnail generation.
+			case WINCODEC_ERR_UNSUPPORTEDOPERATION:
+				encoder.isThumbnailGenerated = false;
+				return encoder.flushAsync();
+			default:
+				throw error;
+		}
+	}).then(function () {
+		// Overwrite the contents of the file with the updated image stream.
+		memStream.seek(0);
+		fileStream.seek(0);
+		fileStream.size = 0;
+		return Windows.Storage.Streams.RandomAccessStream.copyAsync(memStream, fileStream);
+	}).then(function () {
+		// Close each stream to release any locks.
+		memStream && memStream.close();
+		fileStream && fileStream.close();
+
+		return file.copyAsync(Windows.Storage.ApplicationData.current.localFolder, file.name);
+	}).done(function () {
+		successCallback("ms-appdata:///local/" + file.name);
+	}, function (error) {
+		switch (error.number) {
+			// Some image formats (e.g. ICO) do not have encoders.
+			case WINCODEC_ERR_COMPONENTNOTFOUND:
+				errorCallback("Failed to update file: This file format may not support editing.");
+
+				break;
+			default:
+				errorCallback("Failed to update file: " + error.message);
+				break;
+		}
+
+		memStream && memStream.close();
+		fileStream && fileStream.close();
+	});
 }
 
 // Because of asynchronous method, so let the successCallback be called in it.
